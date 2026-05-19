@@ -178,3 +178,134 @@ export async function hasSpotifyConnection(
     .maybeSingle();
   return !!data;
 }
+
+// ---------- Derived metrics ----------
+
+/**
+ * Aggregates plays-per-genre across the user's top artists.
+ * Each artist contributes its play count to every genre tag it has.
+ */
+export function genreDistribution(artists: Artist[]) {
+  const counts: Record<string, number> = {}
+  for (const a of artists) {
+    for (const g of a.genres) {
+      counts[g] = (counts[g] ?? 0) + a.plays
+    }
+  }
+  const total = Object.values(counts).reduce((s, n) => s + n, 0) || 1
+  return Object.entries(counts)
+    .map(([name, plays]) => ({ name, plays, pct: plays / total }))
+    .sort((a, b) => b.plays - a.plays)
+}
+
+/**
+ * Shannon entropy of the genre distribution, normalized to 0–100.
+ * 0 = you only listen to one genre. 100 = perfectly even spread.
+ */
+export function diversityScore(dist: { pct: number }[]) {
+  if (dist.length <= 1) return 0
+  const H = -dist.reduce(
+    (s, d) => s + (d.pct > 0 ? d.pct * Math.log(d.pct) : 0),
+    0
+  )
+  const Hmax = Math.log(dist.length)
+  return Math.round((H / Hmax) * 100)
+}
+
+
+
+/**
+ * Builds a 7-day × 24-hour grid of play counts from the user's recently-played history.
+ * Returns: rows[0] = Monday ... rows[6] = Sunday, each with 24 hour counts.
+ *
+ * Real Spotify limit: /me/player/recently-played returns only the last 50 plays,
+ * so this is a snapshot. A production version would aggregate from a plays table
+ * we'd populate via a cron job — noted in README as future work.
+ */
+export function heatmapFromRecent(plays: RecentPlay[]) {
+  // grid[dayIdx][hour] = count. dayIdx 0 = Monday.
+  const grid: number[][] = Array.from({ length: 7 }, () =>
+    new Array(24).fill(0)
+  )
+  for (const p of plays) {
+    const d = new Date(p.playedAt)
+    // JS getDay(): 0=Sun ... 6=Sat. We want 0=Mon ... 6=Sun.
+    const dayIdx = (d.getDay() + 6) % 7
+    grid[dayIdx][d.getHours()] += 1
+  }
+  return grid
+}
+
+/**
+ * Derives a "music personality" archetype from listening signals.
+ *
+ * Note: real Spotify audio-features (energy/valence/danceability) were
+ * deprecated for new apps in Nov 2024. Without them we infer mood from
+ * genre tags, which are still available on artist objects.
+ */
+
+// Genre → rough mood vector (energy, valence). Curated by hand.
+// In a real product this table would have ~500 entries; 30 is enough to demo.
+const GENRE_MOODS: Record<string, { energy: number; valence: number }> = {
+  "indie folk": { energy: 0.35, valence: 0.5 },
+  "bedroom pop": { energy: 0.4, valence: 0.55 },
+  "dream pop": { energy: 0.45, valence: 0.45 },
+  shoegaze: { energy: 0.55, valence: 0.35 },
+  "ambient pop": { energy: 0.3, valence: 0.5 },
+  electronic: { energy: 0.7, valence: 0.6 },
+  "chamber folk": { energy: 0.25, valence: 0.45 },
+  "neo-soul": { energy: 0.5, valence: 0.65 },
+  "r&b": { energy: 0.55, valence: 0.6 },
+  "singer-songwriter": { energy: 0.3, valence: 0.45 },
+  "folk rock": { energy: 0.55, valence: 0.55 },
+  americana: { energy: 0.5, valence: 0.55 },
+  // Defaults for anything not listed: { energy: 0.5, valence: 0.5 }
+}
+
+export interface MoodProfile {
+  energy: number // 0–1
+  valence: number // 0–1, "happiness"
+}
+
+export function inferMood(artists: Artist[]): MoodProfile {
+  let totalPlays = 0
+  let weightedEnergy = 0
+  let weightedValence = 0
+  for (const a of artists) {
+    for (const g of a.genres) {
+      const m = GENRE_MOODS[g] ?? { energy: 0.5, valence: 0.5 }
+      weightedEnergy += m.energy * a.plays
+      weightedValence += m.valence * a.plays
+      totalPlays += a.plays
+    }
+  }
+  if (totalPlays === 0) return { energy: 0.5, valence: 0.5 }
+  return {
+    energy: weightedEnergy / totalPlays,
+    valence: weightedValence / totalPlays,
+  }
+}
+
+export interface Archetype {
+  name: string
+  tagline: string
+}
+
+/**
+ * Maps a mood + diversity score to one of 6 archetypes.
+ * Order matters: more specific conditions come first.
+ */
+export function archetypeFor(mood: MoodProfile, diversity: number): Archetype {
+  const { energy, valence } = mood
+  if (energy < 0.4 && valence < 0.5)
+    return { name: "The Midnight Cartographer", tagline: "maps quiet places" }
+  if (energy > 0.65 && valence > 0.6)
+    return { name: "The Golden Hour", tagline: "sunlit and certain" }
+  if (energy > 0.65)
+    return { name: "The Festival Headliner", tagline: "never stops moving" }
+  if (diversity > 70)
+    return { name: "The Genre Bender", tagline: "lives between stations" }
+  if (energy < 0.4)
+    return { name: "The Vinyl Archivist", tagline: "collects whispers" }
+  return { name: "The Drifter", tagline: "tunes the in-between" }
+}

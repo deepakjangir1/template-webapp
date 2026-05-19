@@ -13,8 +13,15 @@ export default async function DashboardPage() {
 
   if (!user) redirect("/auth/login")
 
-  const connected = await hasSpotifyConnection(supabase, user.id)
-  const data = await getSpotifyData(user.id)
+  // Run these three reads in parallel since they don't depend on each other.
+  const [connected, data, subResult] = await Promise.all([
+    hasSpotifyConnection(supabase, user.id),
+    getSpotifyData(user.id),
+    supabase.from("subscriptions").select("tier").eq("user_id", user.id).maybeSingle(),
+  ])
 
-  return <DashboardClient connected={connected} data={data} />
+  // Default to "free" if no subscription row exists yet.
+  const isPro = subResult.data?.tier === "pro"
+
+  return <DashboardClient connected={connected} data={data} isPro={isPro} />
 }
